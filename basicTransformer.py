@@ -30,22 +30,18 @@ class Transformer(nn.Module):
         return out, decoder_out
 
     def make_pad_mask(self, query, key, pad_idx=1):
-        query_seq_len, key_seq_len = query.size(1), key.size(1)
-
+        # key_mask:   (batch, 1, 1, key_seq_len)   - True where key is not padding
         key_mask = key.ne(pad_idx).unsqueeze(1).unsqueeze(2)
-        key_mask = key_mask.repeat(1, 1, query_seq_len, 1)
-
-        query_mask = query.ne(pad_idx).unsqueeze(1).unsqueeze(2)
-        query_mask = query_mask.repeat(1, 1, 1, key_seq_len)
-
+        # query_mask: (batch, 1, query_seq_len, 1) - True where query is not padding
+        query_mask = query.ne(pad_idx).unsqueeze(1).unsqueeze(-1)
+        # Broadcast to (batch, 1, query_seq_len, key_seq_len)
         mask = key_mask & query_mask
         mask.requires_grad = False
         return mask
 
     def make_subsequent_mask(self, query, key):
         query_seq_len, key_seq_len = query.size(1), key.size(1)
-        tril = torch.tril(np.ones((query_seq_len, key_seq_len)), k = 0).astype('uint8')
-        mask = torch.tensor(trill, dtype=torch.bool, requires_grad=False, device=query.device)
+        mask = torch.tril(torch.ones((query_seq_len, key_seq_len), dtype=torch.bool, device=query.device))
         return mask
 
     def make_tgt_mask(self, tgt):
@@ -58,13 +54,15 @@ class Transformer(nn.Module):
         pad_mask = self.make_pad_mask(src, src)
         return pad_mask
 
+    def make_src_tgt_mask(self, src, tgt):
+        pad_mask = self.make_pad_mask(tgt, src)
+        return pad_mask
+
 
 class Encoder(nn.Module):
     def __init__(self, encoder_block, n_layer):
         super(Encoder, self).__init__()
-        self.layers = []
-        for i in range(n_layer):
-            self.layers.append(copy.deepcopy(encoder_block))
+        self.layers = nn.ModuleList([copy.deepcopy(encoder_block) for _ in range(n_layer)])
 
     def forward(self, src, src_mask):
         out = src
@@ -77,12 +75,12 @@ class EncoderBlock(nn.Module):
         super(EncoderBlock, self).__init__()
         self.self_attention = self_attention
         self.position_ff = position_ff
-        self.residuals = [ResidualConnectionLayer() for _ in range(2)]
+        self.residuals = nn.ModuleList([ResidualConnectionLayer() for _ in range(2)])
 
     def forward(self, src, src_mask):
         out =  src
         out = self.residuals[0](out, lambda out: self.self_attention(query=out, key=out, value=out, mask=src_mask))
-        out = self.residuals[1](self.position_ff(out))
+        out = self.residuals[1](out, self.position_ff)
         return out
 
 
@@ -180,7 +178,7 @@ class DecoderBlock(nn.Module):
         self.self_attention = self_attention
         self.cross_attention = cross_attention
         self.position_ff = position_ff
-        self.residuals = [ResidualConnectionLayer() for _ in range(3)]
+        self.residuals = nn.ModuleList([ResidualConnectionLayer() for _ in range(3)])
 
     def forward(self, tgt, encoder_out, tgt_mask, src_tgt_mask):
         out = tgt
@@ -250,8 +248,8 @@ def build_model(src_vocab_size, tgt_vocab_size, device=torch.device("cpu"), n_la
     attention = MultiHeadAttentionLayer(
             d_model = d_model,
             h = h,
-            qkv_fc = nn.Linear(d_embed, d_ff),
-            out_fc = nn.Linear(d_ff, d_embed))
+            qkv_fc = nn.Linear(d_embed, d_model),
+            out_fc = nn.Linear(d_model, d_embed))
     position_ff =  PositionWiseFeedForwardLayer(
             fc1 = nn.Linear(d_embed, d_ff),
             fc2 = nn.Linear(d_ff, d_embed))
@@ -280,13 +278,27 @@ def build_model(src_vocab_size, tgt_vocab_size, device=torch.device("cpu"), n_la
     return model
 
 
-model = build_model(1000, 1000, device="cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = build_model(1000, 1000, device=device)
 
-dummy_x = torch.randint(0, 100, (1, 10))
-dummy_z = torch.randint(0, 100, (1, 10))
+dummy_x = torch.randint(0, 100, (1, 10)).to(device)
+dummy_z = torch.randint(0, 100, (1, 10)).to(device)
 
 try:
-    torch.onnx.export(model, (dummy_x, dummy_z), "transformer.onnx", input_names=['input'], output_names=['output'])
+    torch.onnx.export(
+        model,
+        (dummy_x, dummy_z),
+        "transformer.onnx",
+        input_names=['src', 'tgt'],
+        output_names=['log_probs', 'decoder_out'],
+        dynamic_axes={
+            'src': {0: 'batch_size', 1: 'src_seq_len'},
+            'tgt': {0: 'batch_size', 1: 'tgt_seq_len'},
+            'log_probs': {0: 'batch_size', 1: 'tgt_seq_len'},
+            'decoder_out': {0: 'batch_size', 1: 'tgt_seq_len'},
+        },
+        opset_version=14,
+    )
     print("Model successfully exported")
 
 except Exception as e:
